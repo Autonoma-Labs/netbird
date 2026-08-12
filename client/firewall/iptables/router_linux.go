@@ -3,6 +3,7 @@
 package iptables
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -51,6 +52,10 @@ const (
 	markManglePost = "mark-mangle-post"
 	matchSet       = "--match-set"
 
+	// routeSourceSuffix names the extra rules a route ACL needs when ipset is
+	// unusable and each source prefix has to be matched by its own rule.
+	routeSourceSuffix = "_src"
+
 	dnatSuffix = "_dnat"
 	snatSuffix = "_snat"
 	fwdSuffix  = "_fwd"
@@ -68,7 +73,6 @@ type ruleInfo struct {
 }
 
 type routeFilteringRuleParams struct {
-	Source      firewall.Network
 	Destination firewall.Network
 	Proto       firewall.Protocol
 	SPort       *firewall.Port
@@ -90,12 +94,13 @@ type router struct {
 	legacyManagement bool
 	mtu              uint16
 	v6               bool
+	ipsetSupport     *ipsetSupport
 
 	stateManager *statemanager.Manager
 	ipFwdState   *ipfwdstate.IPForwardingState
 }
 
-func newRouter(iptablesClient *iptables.IPTables, wgIface iFaceMapper, mtu uint16) (*router, error) {
+func newRouter(iptablesClient *iptables.IPTables, wgIface iFaceMapper, mtu uint16, ipsetSupport *ipsetSupport) (*router, error) {
 	r := &router{
 		iptablesClient: iptablesClient,
 		rules:          make(map[string][]string),
@@ -103,6 +108,7 @@ func newRouter(iptablesClient *iptables.IPTables, wgIface iFaceMapper, mtu uint1
 		mtu:            mtu,
 		v6:             iptablesClient.Proto() == iptables.ProtocolIPv6,
 		ipFwdState:     ipfwdstate.NewIPForwardingState(wgIface.Name()),
+		ipsetSupport:   ipsetSupport,
 	}
 
 	r.ipsetCounter = refcounter.New(
@@ -151,15 +157,7 @@ func (r *router) AddRouteFiltering(
 		return ruleKey, nil
 	}
 
-	var source firewall.Network
-	if len(sources) > 1 {
-		source.Set = firewall.NewPrefixSet(sources)
-	} else if len(sources) > 0 {
-		source.Prefix = sources[0]
-	}
-
 	params := routeFilteringRuleParams{
-		Source:      source,
 		Destination: destination,
 		Proto:       proto,
 		SPort:       sPort,
@@ -167,28 +165,134 @@ func (r *router) AddRouteFiltering(
 		Action:      action,
 	}
 
-	rule, err := r.genRouteRuleSpec(params, sources)
+	err := r.installRouteRules(string(ruleKey), params, sources, r.ipsetSupport.supported())
+
+	var unusable *ipsetUnusableError
+	if errors.As(err, &unusable) {
+		// The set could not be created or matched. Retry matching each source
+		// prefix on its own; only if that works do we know ipset was to blame.
+		r.removeRouteRules(string(ruleKey))
+
+		if retryErr := r.installRouteRules(string(ruleKey), params, sources, false); retryErr != nil {
+			return nil, fmt.Errorf("add route rule (ipset: %w): %w", unusable.cause, retryErr)
+		}
+
+		r.ipsetSupport.markUnsupported(unusable.cause)
+		err = nil
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("generate route rule spec: %w", err)
+		return nil, fmt.Errorf("add route rule: %w", err)
 	}
-
-	// Insert DROP rules at the beginning, append ACCEPT rules at the end
-	if action == firewall.ActionDrop {
-		// after the established rule
-		err = r.iptablesClient.Insert(tableFilter, chainRTFWDIN, 2, rule...)
-	} else {
-		err = r.iptablesClient.Append(tableFilter, chainRTFWDIN, rule...)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("add route rule: %v", err)
-	}
-
-	r.rules[string(ruleKey)] = rule
 
 	r.updateState()
 
 	return ruleKey, nil
+}
+
+// installRouteRules installs every rule needed for one route ACL and records them
+// under ruleKey. It is more than one rule only when useIPSet is false and the
+// sources have to be matched one prefix at a time.
+func (r *router) installRouteRules(ruleKey string, params routeFilteringRuleParams, sources []netip.Prefix, useIPSet bool) error {
+	specs, err := r.genRouteRuleSpecs(params, sources, useIPSet)
+	if err != nil {
+		return fmt.Errorf("generate route rule spec: %w", err)
+	}
+
+	for i, spec := range specs {
+		if err := r.insertRouteRule(params.Action, spec); err != nil {
+			if len(r.findSets(spec)) > 0 {
+				return ipsetUnusable(err)
+			}
+			return err
+		}
+		r.rules[routeRuleKey(ruleKey, i)] = spec
+	}
+
+	return nil
+}
+
+// genRouteRuleSpecs builds the rules for one route ACL. With ipset available that
+// is a single rule matching a set of sources; without it, one rule per source
+// prefix, which is the only form a stripped kernel can express.
+func (r *router) genRouteRuleSpecs(params routeFilteringRuleParams, sources []netip.Prefix, useIPSet bool) ([][]string, error) {
+	destExp, err := r.applyNetwork("-d", params.Destination, nil)
+	if err != nil {
+		return nil, fmt.Errorf("apply network -d: %w", err)
+	}
+
+	if useIPSet || len(sources) <= 1 {
+		sourceExp, err := r.applyNetwork("-s", sourceNetwork(sources), sources)
+		if err != nil {
+			return nil, fmt.Errorf("apply network -s: %w", err)
+		}
+
+		return [][]string{assembleRouteRule(sourceExp, destExp, params, r.v6)}, nil
+	}
+
+	specs := make([][]string, 0, len(sources))
+	for _, source := range sources {
+		sourceExp, err := r.applyNetwork("-s", firewall.Network{Prefix: source}, nil)
+		if err != nil {
+			return nil, fmt.Errorf("apply network -s: %w", err)
+		}
+
+		specs = append(specs, assembleRouteRule(sourceExp, destExp, params, r.v6))
+	}
+
+	return specs, nil
+}
+
+func sourceNetwork(sources []netip.Prefix) firewall.Network {
+	var source firewall.Network
+	if len(sources) > 1 {
+		source.Set = firewall.NewPrefixSet(sources)
+	} else if len(sources) > 0 {
+		source.Prefix = sources[0]
+	}
+
+	return source
+}
+
+func (r *router) insertRouteRule(action firewall.Action, spec []string) error {
+	// Insert DROP rules at the beginning, append ACCEPT rules at the end
+	if action == firewall.ActionDrop {
+		// after the established rule
+		return r.iptablesClient.Insert(tableFilter, chainRTFWDIN, 2, spec...)
+	}
+
+	return r.iptablesClient.Append(tableFilter, chainRTFWDIN, spec...)
+}
+
+// removeRouteRules deletes the rules recorded for ruleKey, used to undo a partial
+// install before retrying without ipset.
+func (r *router) removeRouteRules(ruleKey string) {
+	for i := 0; ; i++ {
+		key := routeRuleKey(ruleKey, i)
+		spec, exists := r.rules[key]
+		if !exists {
+			return
+		}
+
+		if err := r.iptablesClient.DeleteIfExists(tableFilter, chainRTFWDIN, spec...); err != nil {
+			log.Debugf("delete partial route rule %s: %v", key, err)
+		}
+		delete(r.rules, key)
+
+		if err := r.decrementSetCounter(spec); err != nil {
+			log.Debugf("decrement ipset counter for %s: %v", key, err)
+		}
+	}
+}
+
+// routeRuleKey names the i-th rule of a route ACL. The first keeps the plain rule
+// key so single-rule ACLs, which is every ACL when ipset works, are unaffected.
+func routeRuleKey(ruleKey string, i int) string {
+	if i == 0 {
+		return ruleKey
+	}
+
+	return fmt.Sprintf("%s%s%d", ruleKey, routeSourceSuffix, i)
 }
 
 func (r *router) hasRule(id string) bool {
@@ -199,17 +303,29 @@ func (r *router) hasRule(id string) bool {
 func (r *router) DeleteRouteRule(rule firewall.Rule) error {
 	ruleKey := rule.ID()
 
-	if rule, exists := r.rules[ruleKey]; exists {
+	if _, exists := r.rules[ruleKey]; !exists {
+		log.Debugf("route rule %s not found", ruleKey)
+		r.updateState()
+
+		return nil
+	}
+
+	// In the ipset fallback one ACL is several rules, one per source prefix.
+	for i := 0; ; i++ {
+		key := routeRuleKey(ruleKey, i)
+		rule, exists := r.rules[key]
+		if !exists {
+			break
+		}
+
 		if err := r.iptablesClient.Delete(tableFilter, chainRTFWDIN, rule...); err != nil {
 			return fmt.Errorf("delete route rule: %v", err)
 		}
-		delete(r.rules, ruleKey)
+		delete(r.rules, key)
 
 		if err := r.decrementSetCounter(rule); err != nil {
 			return fmt.Errorf("decrement ipset counter: %w", err)
 		}
-	} else {
-		log.Debugf("route rule %s not found", ruleKey)
 	}
 
 	r.updateState()
@@ -927,31 +1043,23 @@ func (r *router) DeleteDNATRule(rule firewall.Rule) error {
 	return nberrors.FormatErrorOrNil(merr)
 }
 
-func (r *router) genRouteRuleSpec(params routeFilteringRuleParams, sources []netip.Prefix) ([]string, error) {
+// assembleRouteRule joins the pre-built source and destination matches with the
+// protocol, ports and target of a route ACL.
+func assembleRouteRule(sourceExp, destExp []string, params routeFilteringRuleParams, v6 bool) []string {
 	var rule []string
-
-	sourceExp, err := r.applyNetwork("-s", params.Source, sources)
-	if err != nil {
-		return nil, fmt.Errorf("apply network -s: %w", err)
-
-	}
-	destExp, err := r.applyNetwork("-d", params.Destination, nil)
-	if err != nil {
-		return nil, fmt.Errorf("apply network -d: %w", err)
-	}
 
 	rule = append(rule, sourceExp...)
 	rule = append(rule, destExp...)
 
 	if params.Proto != firewall.ProtocolALL {
-		rule = append(rule, "-p", strings.ToLower(protoForFamily(params.Proto, r.v6)))
+		rule = append(rule, "-p", strings.ToLower(protoForFamily(params.Proto, v6)))
 		rule = append(rule, applyPort("--sport", params.SPort)...)
 		rule = append(rule, applyPort("--dport", params.DPort)...)
 	}
 
 	rule = append(rule, "-j", actionToStr(params.Action))
 
-	return rule, nil
+	return rule
 }
 
 func (r *router) applyNetwork(flag string, network firewall.Network, prefixes []netip.Prefix) ([]string, error) {
@@ -961,9 +1069,17 @@ func (r *router) applyNetwork(flag string, network firewall.Network, prefixes []
 	}
 
 	if network.IsSet() {
+		// A destination set is populated later from DNS results, so unlike a
+		// source set it cannot be expanded into per-prefix rules here. Without
+		// ipset such a rule is not expressible; report it instead of installing
+		// something broader than the policy allows.
+		if flag == "-d" && !r.ipsetSupport.supported() {
+			return nil, fmt.Errorf("destination set %s requires ipset (ip_set_hash_net and xt_set)", network.Set.HashedName())
+		}
+
 		name := r.ipsetName(network.Set.HashedName())
 		if _, err := r.ipsetCounter.Increment(name, prefixes); err != nil {
-			return nil, fmt.Errorf("create or get ipset: %w", err)
+			return nil, ipsetUnusable(fmt.Errorf("create or get ipset: %w", err))
 		}
 
 		return []string{"-m", "set", matchSet, name, direction}, nil

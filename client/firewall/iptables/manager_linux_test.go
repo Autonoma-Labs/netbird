@@ -292,39 +292,97 @@ func TestIptablesCreatePerformance(t *testing.T) {
 	}
 }
 
-// TestIptablesACLIPSetFallback verifies that when the kernel lacks ipset support,
-// the ACL manager falls back to per-IP iptables rules (-s <ip>) instead of
-// silently leaving the chain empty. See discussion #6125.
-func TestIptablesACLIPSetFallback(t *testing.T) {
-	ipv4Client, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
-	require.NoError(t, err)
+// newACLTestManager returns a started manager. Create()/Init() is used so the
+// router-owned chains (chainRTFWDIN/OUT) exist before the ACL manager's
+// createDefaultChains() references them.
+func newACLTestManager(t *testing.T) *Manager {
+	t.Helper()
 
-	// Use Create()/Init() so the router-owned chains (chainRTFWDIN/OUT) are
-	// created before the ACL manager's createDefaultChains() references them.
 	manager, err := Create(ifaceMock, iface.DefaultMTU)
 	require.NoError(t, err)
 	require.NoError(t, manager.Init(nil))
-
-	aclMgr := manager.aclMgr
-	// Simulate a kernel without the ipset hash module.
-	aclMgr.ipsetSupported = false
-
-	defer func() {
+	t.Cleanup(func() {
 		require.NoError(t, manager.Close(nil))
-	}()
+	})
+
+	return manager
+}
+
+// TestIptablesACLUsesIPSetOnHealthyKernel guards the default: on a kernel that
+// does have ipset, rules must keep matching a set. A regression that reported
+// ipset as unusable would silently move every Linux client to per-IP rules.
+func TestIptablesACLUsesIPSetOnHealthyKernel(t *testing.T) {
+	ipv4Client, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	manager := newACLTestManager(t)
 
 	ip := netip.MustParseAddr("10.20.0.42")
 	port := &fw.Port{Values: []uint16{22}}
 
-	rules, err := aclMgr.AddPeerFiltering(nil, ip.AsSlice(), "tcp", nil, port, fw.ActionAccept, "nb0000001")
-	require.NoError(t, err, "AddPeerFiltering should succeed via fallback")
+	rules, err := manager.aclMgr.AddPeerFiltering(nil, ip.AsSlice(), "tcp", nil, port, fw.ActionAccept, "nb0000001")
+	require.NoError(t, err)
+	require.NotEmpty(t, rules)
+
+	rule := rules[0].(*Rule)
+	require.Equal(t, "nb0000001-dport", rule.ipsetName, "healthy kernel must use an ipset")
+	require.Contains(t, rule.specs, "--match-set")
+	require.True(t, manager.ipsetSupport.supported(), "ipset must not be latched off on a healthy kernel")
+
+	checkRuleSpecs(t, ipv4Client, rule.chain, true, rule.specs...)
+}
+
+// TestIptablesACLFallsBackWhenIPSetUnusable drives the real failure path: an
+// oversized set name is rejected by the kernel, which stands in for a kernel
+// without ip_set_hash_net or xt_set. The rule must still land in the chain,
+// matching the IP directly, and the capability must latch off so later rules skip
+// ipset. Before the fallback existed, the rule was dropped and the catch-all DROP
+// silently blocked traffic the policy permits.
+func TestIptablesACLFallsBackWhenIPSetUnusable(t *testing.T) {
+	ipv4Client, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	manager := newACLTestManager(t)
+
+	// ipset names are limited to 31 characters, so creating this set fails.
+	unusableName := strings.Repeat("a", 40)
+
+	ip := netip.MustParseAddr("10.20.0.42")
+	port := &fw.Port{Values: []uint16{22}}
+
+	rules, err := manager.aclMgr.AddPeerFiltering(nil, ip.AsSlice(), "tcp", nil, port, fw.ActionAccept, unusableName)
+	require.NoError(t, err, "AddPeerFiltering must succeed by falling back")
 	require.NotEmpty(t, rules)
 
 	rule := rules[0].(*Rule)
 	require.Empty(t, rule.ipsetName, "fallback rule must not reference an ipset")
-	require.Contains(t, strings.Join(rule.specs, " "), "-s 10.20.0.42", "fallback rule must match by source IP")
-	require.NotContains(t, strings.Join(rule.specs, " "), "--match-set", "fallback rule must not use ipset matching")
+	require.Contains(t, strings.Join(rule.specs, " "), "-s 10.20.0.42", "fallback rule must match the source IP")
+	require.NotContains(t, strings.Join(rule.specs, " "), "--match-set")
 
-	// The rule must actually be present in the ACL chain (not silently dropped).
+	// The rule must actually be present, not silently missing.
 	checkRuleSpecs(t, ipv4Client, rule.chain, true, rule.specs...)
+
+	require.False(t, manager.ipsetSupport.supported(), "failure must latch ipset off")
+
+	// A subsequent rule with a perfectly valid set name now skips ipset too.
+	next, err := manager.aclMgr.AddPeerFiltering(nil, netip.MustParseAddr("10.20.0.43").AsSlice(), "tcp", nil, port, fw.ActionAccept, "nb0000001")
+	require.NoError(t, err)
+	require.NotEmpty(t, next)
+	require.Empty(t, next[0].(*Rule).ipsetName, "later rules must skip ipset once latched")
+}
+
+// TestIptablesACLLeavesNoIPSetAfterFallback verifies the set created before the
+// failure is destroyed, so a later rule does not find a half-built set and assume
+// ipset works.
+func TestIptablesACLLeavesNoIPSetAfterFallback(t *testing.T) {
+	manager := newACLTestManager(t)
+
+	port := &fw.Port{Values: []uint16{22}}
+	ip := netip.MustParseAddr("10.20.0.42")
+
+	_, err := manager.aclMgr.AddPeerFiltering(nil, ip.AsSlice(), "tcp", nil, port, fw.ActionAccept, strings.Repeat("a", 40))
+	require.NoError(t, err)
+
+	_, exists := manager.aclMgr.ipsetStore.ipset(strings.Repeat("a", 40) + "-dport")
+	require.False(t, exists, "unusable set must not stay in the store")
 }

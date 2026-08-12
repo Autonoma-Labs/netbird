@@ -42,12 +42,12 @@ type aclManager struct {
 	optionalEntries map[string][]entry
 	ipsetStore      *ipsetStore
 	v6              bool
-	ipsetSupported  bool
+	ipsetSupport    *ipsetSupport
 
 	stateManager *statemanager.Manager
 }
 
-func newAclManager(iptablesClient *iptables.IPTables, wgIface iFaceMapper) (*aclManager, error) {
+func newAclManager(iptablesClient *iptables.IPTables, wgIface iFaceMapper, ipsetSupport *ipsetSupport) (*aclManager, error) {
 	return &aclManager{
 		iptablesClient:  iptablesClient,
 		wgIface:         wgIface,
@@ -55,13 +55,12 @@ func newAclManager(iptablesClient *iptables.IPTables, wgIface iFaceMapper) (*acl
 		optionalEntries: make(map[string][]entry),
 		ipsetStore:      newIpsetStore(),
 		v6:              iptablesClient.Proto() == iptables.ProtocolIPv6,
+		ipsetSupport:    ipsetSupport,
 	}, nil
 }
 
 func (m *aclManager) init(stateManager *statemanager.Manager) error {
 	m.stateManager = stateManager
-
-	m.ipsetSupported = m.probeIPSetSupport()
 
 	m.seedInitialEntries()
 	m.seedInitialOptionalEntries()
@@ -88,18 +87,71 @@ func (m *aclManager) AddPeerFiltering(
 	action firewall.Action,
 	ipsetName string,
 ) ([]firewall.Rule, error) {
-	chain := chainNameInputRules
+	ipsetName = m.resolveIPSetName(ipsetName, sPort, dPort, action)
+	if ipsetName == "" {
+		return m.addPeerRule(ip, protocol, sPort, dPort, action, "")
+	}
 
+	rules, err := m.addPeerRule(ip, protocol, sPort, dPort, action, ipsetName)
+	if err == nil {
+		return rules, nil
+	}
+
+	var unusable *ipsetUnusableError
+	if !errors.As(err, &unusable) {
+		return nil, err
+	}
+
+	// The set could not be created or matched. Drop whatever was created and
+	// retry the rule matching the IP directly; only if that succeeds do we know
+	// ipset was to blame and latch it off for subsequent rules.
+	m.discardIPSet(ipsetName)
+
+	rules, retryErr := m.addPeerRule(ip, protocol, sPort, dPort, action, "")
+	if retryErr != nil {
+		return nil, fmt.Errorf("add peer rule (ipset: %w): %w", unusable.cause, retryErr)
+	}
+
+	m.ipsetSupport.markUnsupported(unusable.cause)
+
+	return rules, nil
+}
+
+// resolveIPSetName derives the ipset name for a rule, returning "" when the rule
+// must match the IP directly: either no set was requested or ipset is unusable.
+func (m *aclManager) resolveIPSetName(ipsetName string, sPort, dPort *firewall.Port, action firewall.Action) string {
 	ipsetName = transformIPsetName(ipsetName, sPort, dPort, action)
-	if m.v6 && ipsetName != "" {
+	if ipsetName == "" || !m.ipsetSupport.supported() {
+		return ""
+	}
+
+	if m.v6 {
 		ipsetName += "-v6"
 	}
-	// When the kernel lacks the required ipset hash module, fall back to
-	// per-IP iptables rules (pre-0.68 behavior) so ACLs keep working instead
-	// of silently leaving the chain empty.
-	if ipsetName != "" && !m.ipsetSupported {
-		ipsetName = ""
+
+	return ipsetName
+}
+
+// discardIPSet removes a set that turned out to be unusable, so a later rule
+// does not find it in the store and assume it works.
+func (m *aclManager) discardIPSet(ipsetName string) {
+	m.ipsetStore.deleteIpset(ipsetName)
+
+	if err := m.destroyIPSet(ipsetName); err != nil {
+		log.Debugf("destroy unusable ipset %s: %v", ipsetName, err)
 	}
+}
+
+func (m *aclManager) addPeerRule(
+	ip net.IP,
+	protocol firewall.Protocol,
+	sPort *firewall.Port,
+	dPort *firewall.Port,
+	action firewall.Action,
+	ipsetName string,
+) ([]firewall.Rule, error) {
+	chain := chainNameInputRules
+
 	proto := protoForFamily(protocol, m.v6)
 	specs := filterRuleSpecs(ip, proto, sPort, dPort, action, ipsetName)
 
@@ -114,7 +166,7 @@ func (m *aclManager) AddPeerFiltering(
 	if ipsetName != "" {
 		if ipList, ipsetExists := m.ipsetStore.ipset(ipsetName); ipsetExists {
 			if err := m.addToIPSet(ipsetName, ip); err != nil {
-				return nil, fmt.Errorf("add IP to ipset: %w", err)
+				return nil, ipsetUnusable(fmt.Errorf("add IP to ipset: %w", err))
 			}
 			// if ruleset already exists it means we already have the firewall rule
 			// so we need to update IPs in the ruleset and return new fw.Rule object for ACL manager.
@@ -137,10 +189,10 @@ func (m *aclManager) AddPeerFiltering(
 			}
 		}
 		if err := m.createIPSet(ipsetName); err != nil {
-			return nil, fmt.Errorf("create ipset: %w", err)
+			return nil, ipsetUnusable(fmt.Errorf("create ipset: %w", err))
 		}
 		if err := m.addToIPSet(ipsetName, ip); err != nil {
-			return nil, fmt.Errorf("add IP to ipset: %w", err)
+			return nil, ipsetUnusable(fmt.Errorf("add IP to ipset: %w", err))
 		}
 
 		ipList := newIpList(ip.String())
@@ -149,7 +201,7 @@ func (m *aclManager) AddPeerFiltering(
 
 	ok, err := m.iptablesClient.Exists(tableFilter, chain, specs...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check rule: %w", err)
+		return nil, maybeIPSetUnusable(ipsetName, fmt.Errorf("check rule: %w", err))
 	}
 	if ok {
 		return nil, fmt.Errorf("rule already exists")
@@ -163,7 +215,7 @@ func (m *aclManager) AddPeerFiltering(
 		err = m.iptablesClient.Append(tableFilter, chain, specs...)
 	}
 	if err != nil {
-		return nil, err
+		return nil, maybeIPSetUnusable(ipsetName, err)
 	}
 
 	if err := m.iptablesClient.Append(tableMangle, chainRTPRE, mangleSpecs...); err != nil {
@@ -505,40 +557,6 @@ func transformIPsetName(ipsetName string, sPort, dPort *firewall.Port, action fi
 	default:
 		return ipsetName + actionSuffix
 	}
-}
-
-// probeIPSetSupport checks whether the kernel can create the ipset type used for
-// ACL rules. On kernels lacking the required ipset hash module, ipset creation
-// fails (e.g. "invalid argument"), which would otherwise leave the ACL chain
-// empty and silently drop all policy-permitted inbound traffic. When unsupported,
-// the manager falls back to per-IP iptables rules.
-func (m *aclManager) probeIPSetSupport() bool {
-	// Use a unique name so concurrent processes don't collide and we only ever
-	// destroy the set we created ourselves. ipset names are limited to 31 chars,
-	// so use a short random suffix.
-	probeName := "nb-probe-" + uuid.New().String()[:8]
-
-	opts := ipset.CreateOptions{
-		Replace: true,
-	}
-	if m.v6 {
-		opts.Family = ipset.FamilyIPV6
-	}
-
-	if err := ipset.Create(probeName, ipset.TypeHashNet, opts); err != nil {
-		log.Warnf("ipset is not available (failed to create probe set: %v); "+
-			"falling back to per-IP iptables ACL rules. Ensure the kernel provides "+
-			"the ipset hash:net module (ip_set_hash_net) for better performance with large rule sets", err)
-		return false
-	}
-
-	defer func() {
-		if err := ipset.Destroy(probeName); err != nil {
-			log.Debugf("destroy ipset probe set %q: %v", probeName, err)
-		}
-	}()
-
-	return true
 }
 
 func (m *aclManager) createIPSet(name string) error {

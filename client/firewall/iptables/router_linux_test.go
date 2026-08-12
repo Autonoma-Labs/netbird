@@ -3,9 +3,11 @@
 package iptables
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -16,6 +18,7 @@ import (
 	"github.com/netbirdio/netbird/client/firewall/test"
 	"github.com/netbirdio/netbird/client/iface"
 	nbnet "github.com/netbirdio/netbird/client/net"
+	"github.com/netbirdio/netbird/shared/management/domain"
 )
 
 func isIptablesSupported() bool {
@@ -31,7 +34,7 @@ func TestIptablesManager_RestoreOrCreateContainers(t *testing.T) {
 	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 	require.NoError(t, err, "failed to init iptables client")
 
-	manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+	manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, newIPSetSupport())
 	require.NoError(t, err, "should return a valid iptables manager")
 	require.NoError(t, manager.init(nil))
 
@@ -84,7 +87,7 @@ func TestIptablesManager_AddNatRule(t *testing.T) {
 			iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 			require.NoError(t, err, "failed to init iptables client")
 
-			manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+			manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, newIPSetSupport())
 			require.NoError(t, err, "shouldn't return error")
 			require.NoError(t, manager.init(nil))
 
@@ -157,7 +160,7 @@ func TestIptablesManager_RemoveNatRule(t *testing.T) {
 		t.Run(testCase.Name, func(t *testing.T) {
 			iptablesClient, _ := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 
-			manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+			manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, newIPSetSupport())
 			require.NoError(t, err, "shouldn't return error")
 			require.NoError(t, manager.init(nil))
 			defer func() {
@@ -219,7 +222,7 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 	require.NoError(t, err, "Failed to create iptables client")
 
-	r, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+	r, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, newIPSetSupport())
 	require.NoError(t, err, "Failed to create router manager")
 	require.NoError(t, r.init(nil))
 
@@ -337,27 +340,26 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			ruleKey, err := r.AddRouteFiltering(nil, tt.sources, firewall.Network{Prefix: tt.destination}, tt.proto, tt.sPort, tt.dPort, tt.action)
 			require.NoError(t, err, "AddRouteFiltering failed")
 
-			// Check if the rule is in the internal map
-			rule, ok := r.rules[ruleKey.ID()]
-			assert.True(t, ok, "Rule not found in internal map")
+			// A kernel without usable ipset splits a multi-source ACL into one
+			// rule per source, so compare against whichever form is in effect.
+			useIPSet := r.ipsetSupport.supported()
 
-			// Log the internal rule
-			t.Logf("Internal rule: %v", rule)
+			// Check if the rules are in the internal map
+			rules := routeRuleSpecs(t, r, ruleKey.ID())
+			require.NotEmpty(t, rules, "Rule not found in internal map")
 
-			// Check if the rule exists in iptables
-			exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, rule...)
-			assert.NoError(t, err, "Failed to check rule existence")
-			assert.True(t, exists, "Rule not found in iptables")
+			// Log the internal rules
+			t.Logf("Internal rules: %v", rules)
 
-			var source firewall.Network
-			if len(tt.sources) > 1 {
-				source.Set = firewall.NewPrefixSet(tt.sources)
-			} else if len(tt.sources) > 0 {
-				source.Prefix = tt.sources[0]
+			// Check if the rules exist in iptables
+			for _, rule := range rules {
+				exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, rule...)
+				assert.NoError(t, err, "Failed to check rule existence")
+				assert.True(t, exists, "Rule not found in iptables")
 			}
+
 			// Verify rule content
 			params := routeFilteringRuleParams{
-				Source:      source,
 				Destination: firewall.Network{Prefix: tt.destination},
 				Proto:       tt.proto,
 				SPort:       tt.sPort,
@@ -365,20 +367,18 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 				Action:      tt.action,
 			}
 
-			expectedRule, err := r.genRouteRuleSpec(params, nil)
+			expectedRules, err := r.genRouteRuleSpecs(params, tt.sources, useIPSet)
 			require.NoError(t, err, "Failed to generate expected rule spec")
 
-			if tt.expectSet {
+			if tt.expectSet && useIPSet {
 				setName := firewall.NewPrefixSet(tt.sources).HashedName()
-				expectedRule, err = r.genRouteRuleSpec(params, nil)
-				require.NoError(t, err, "Failed to generate expected rule spec with set")
 
 				// Check if the set was created
 				_, exists := r.ipsetCounter.Get(setName)
 				assert.True(t, exists, "IPSet not created")
 			}
 
-			assert.Equal(t, expectedRule, rule, "Rule content mismatch")
+			assert.Equal(t, expectedRules, rules, "Rule content mismatch")
 
 			// Clean up
 			err = r.DeleteRouteRule(ruleKey)
@@ -443,5 +443,106 @@ func TestFindSetNameInRule(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRouter_AddRouteFilteringIPSetFallback covers a kernel that cannot use ipset:
+// a multi-source route ACL must become one rule per source prefix, all present in
+// the chain, and deleting the ACL must remove every one of them. Without the
+// fallback the rule was never installed and the interface-wide DROP in FORWARD
+// silently dropped routed traffic.
+func TestRouter_AddRouteFilteringIPSetFallback(t *testing.T) {
+	if !isIptablesSupported() {
+		t.Skip("iptables not supported on this system")
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	support := newIPSetSupport()
+	support.markUnsupported(errors.New("test: pretend the kernel has no ipset"))
+
+	r, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, support)
+	require.NoError(t, err)
+	require.NoError(t, r.init(nil))
+	t.Cleanup(func() {
+		require.NoError(t, r.Reset())
+	})
+
+	sources := []netip.Prefix{
+		netip.MustParsePrefix("172.16.0.0/16"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+	}
+	destination := firewall.Network{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
+
+	rule, err := r.AddRouteFiltering(nil, sources, destination, firewall.ProtocolTCP, nil,
+		&firewall.Port{Values: []uint16{443}}, firewall.ActionAccept)
+	require.NoError(t, err, "route ACL must install without ipset")
+
+	specs := routeRuleSpecs(t, r, rule.ID())
+	require.Len(t, specs, len(sources), "each source prefix needs its own rule")
+
+	for i, spec := range specs {
+		joined := strings.Join(spec, " ")
+		require.Contains(t, joined, "-s "+sources[i].String(), "rule must match the source prefix directly")
+		require.NotContains(t, joined, matchSet, "fallback rule must not reference a set")
+
+		exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, spec...)
+		require.NoError(t, err)
+		require.True(t, exists, "rule %d must be present in %s", i, chainRTFWDIN)
+	}
+
+	require.NoError(t, r.DeleteRouteRule(rule))
+
+	for i, spec := range specs {
+		exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, spec...)
+		require.NoError(t, err)
+		require.False(t, exists, "rule %d must be removed", i)
+	}
+	require.Empty(t, routeRuleSpecs(t, r, rule.ID()), "no rule may be left recorded")
+}
+
+// TestRouter_DestinationSetRequiresIPSet documents that a dynamic (domain)
+// destination cannot be expressed without ipset: its prefixes are only known
+// after DNS resolution, so there is nothing to expand into per-prefix rules. The
+// call must report that rather than install a broader rule than the policy allows.
+func TestRouter_DestinationSetRequiresIPSet(t *testing.T) {
+	if !isIptablesSupported() {
+		t.Skip("iptables not supported on this system")
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	support := newIPSetSupport()
+	support.markUnsupported(errors.New("test: pretend the kernel has no ipset"))
+
+	r, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, support)
+	require.NoError(t, err)
+	require.NoError(t, r.init(nil))
+	t.Cleanup(func() {
+		require.NoError(t, r.Reset())
+	})
+
+	destination := firewall.Network{Set: firewall.NewDomainSet(domain.List{"example.com"})}
+
+	_, err = r.AddRouteFiltering(nil, []netip.Prefix{netip.MustParsePrefix("172.16.0.0/16")},
+		destination, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.Error(t, err, "a domain destination is not expressible without ipset")
+	require.ErrorContains(t, err, "requires ipset")
+}
+
+// routeRuleSpecs collects the rules recorded for one route ACL, which is more than
+// one when the ipset fallback splits it per source prefix.
+func routeRuleSpecs(t *testing.T, r *router, ruleKey string) [][]string {
+	t.Helper()
+
+	var specs [][]string
+	for i := 0; ; i++ {
+		spec, exists := r.rules[routeRuleKey(ruleKey, i)]
+		if !exists {
+			return specs
+		}
+		specs = append(specs, spec)
 	}
 }

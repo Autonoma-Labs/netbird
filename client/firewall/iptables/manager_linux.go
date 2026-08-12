@@ -33,6 +33,10 @@ type Manager struct {
 	router       *router
 	rawSupported bool
 
+	// ipsetSupport is shared by the ACL managers and routers of both families,
+	// so a kernel without usable ipset support degrades them together.
+	ipsetSupport *ipsetSupport
+
 	// IPv6 counterparts, nil when no v6 overlay
 	ipv6Client *iptables.IPTables
 	aclMgr6    *aclManager
@@ -53,16 +57,17 @@ func Create(wgIface iFaceMapper, mtu uint16) (*Manager, error) {
 	}
 
 	m := &Manager{
-		wgIface:    wgIface,
-		ipv4Client: iptablesClient,
+		wgIface:      wgIface,
+		ipv4Client:   iptablesClient,
+		ipsetSupport: newIPSetSupport(),
 	}
 
-	m.router, err = newRouter(iptablesClient, wgIface, mtu)
+	m.router, err = newRouter(iptablesClient, wgIface, mtu, m.ipsetSupport)
 	if err != nil {
 		return nil, fmt.Errorf("create router: %w", err)
 	}
 
-	m.aclMgr, err = newAclManager(iptablesClient, wgIface)
+	m.aclMgr, err = newAclManager(iptablesClient, wgIface, m.ipsetSupport)
 	if err != nil {
 		return nil, fmt.Errorf("create acl manager: %w", err)
 	}
@@ -83,7 +88,7 @@ func (m *Manager) createIPv6Components(wgIface iFaceMapper, mtu uint16) error {
 	}
 	m.ipv6Client = ip6Client
 
-	m.router6, err = newRouter(ip6Client, wgIface, mtu)
+	m.router6, err = newRouter(ip6Client, wgIface, mtu, m.ipsetSupport)
 	if err != nil {
 		return fmt.Errorf("create v6 router: %w", err)
 	}
@@ -92,7 +97,7 @@ func (m *Manager) createIPv6Components(wgIface iFaceMapper, mtu uint16) error {
 	// Forwarding refcounter is per-family but shared between v4 and v6 routers.
 	m.router6.ipFwdState = m.router.ipFwdState
 
-	m.aclMgr6, err = newAclManager(ip6Client, wgIface)
+	m.aclMgr6, err = newAclManager(ip6Client, wgIface, m.ipsetSupport)
 	if err != nil {
 		return fmt.Errorf("create v6 acl manager: %w", err)
 	}
