@@ -92,6 +92,10 @@ func (m *aclManager) AddPeerFiltering(
 		return m.addPeerRule(ip, protocol, sPort, dPort, action, "")
 	}
 
+	// A set that is already in the store backs rules installed earlier, so it must
+	// survive this call's failure.
+	_, preexisting := m.ipsetStore.ipset(ipsetName)
+
 	rules, err := m.addPeerRule(ip, protocol, sPort, dPort, action, ipsetName)
 	if err == nil {
 		return rules, nil
@@ -102,10 +106,12 @@ func (m *aclManager) AddPeerFiltering(
 		return nil, err
 	}
 
-	// The set could not be created or matched. Drop whatever was created and
+	// The set could not be created or matched. Drop the one this call created and
 	// retry the rule matching the IP directly; only if that succeeds do we know
 	// ipset was to blame and latch it off for subsequent rules.
-	m.discardIPSet(ipsetName)
+	if !preexisting {
+		m.discardIPSet(ipsetName)
+	}
 
 	rules, retryErr := m.addPeerRule(ip, protocol, sPort, dPort, action, "")
 	if retryErr != nil {

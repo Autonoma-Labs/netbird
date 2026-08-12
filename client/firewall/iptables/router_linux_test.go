@@ -17,6 +17,7 @@ import (
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/firewall/test"
 	"github.com/netbirdio/netbird/client/iface"
+	nbid "github.com/netbirdio/netbird/client/internal/acl/id"
 	nbnet "github.com/netbirdio/netbird/client/net"
 	"github.com/netbirdio/netbird/shared/management/domain"
 )
@@ -530,6 +531,47 @@ func TestRouter_DestinationSetRequiresIPSet(t *testing.T) {
 		destination, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
 	require.Error(t, err, "a domain destination is not expressible without ipset")
 	require.ErrorContains(t, err, "requires ipset")
+}
+
+// TestRouter_RouteFilteringRollsBackPartialInstall covers a fallback ACL whose
+// second rule cannot be installed. Nothing may be left behind: if the rule key
+// survived, a later call would short-circuit on it and report success while some
+// sources were never installed, leaving them unblocked for a drop rule.
+func TestRouter_RouteFilteringRollsBackPartialInstall(t *testing.T) {
+	if !isIptablesSupported() {
+		t.Skip("iptables not supported on this system")
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	support := newIPSetSupport()
+	support.markUnsupported(errors.New("test: pretend the kernel has no ipset"))
+
+	r, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU, support)
+	require.NoError(t, err)
+	require.NoError(t, r.init(nil))
+	t.Cleanup(func() {
+		require.NoError(t, r.Reset())
+	})
+
+	// The v6 prefix is rejected by the v4 iptables binary, so the second rule of
+	// the expansion fails after the first has been installed.
+	good := netip.MustParsePrefix("172.16.0.0/16")
+	sources := []netip.Prefix{good, netip.MustParsePrefix("2001:db8::/32")}
+	destination := firewall.Network{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
+
+	_, err = r.AddRouteFiltering(nil, sources, destination, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.Error(t, err, "a source that iptables rejects must fail the whole ACL")
+
+	ruleKey := nbid.GenerateRouteRuleKey(sources, destination, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.Empty(t, routeRuleSpecs(t, r, string(ruleKey)), "no rule may stay recorded")
+
+	// The rule that did get installed must be gone from the chain.
+	installed := []string{"-s", good.String(), "-d", "10.0.0.0/8", "-j", "DROP"}
+	exists, err := iptablesClient.Exists(tableFilter, chainRTFWDIN, installed...)
+	require.NoError(t, err)
+	require.False(t, exists, "the already-installed rule must be rolled back")
 }
 
 // routeRuleSpecs collects the rules recorded for one route ACL, which is more than

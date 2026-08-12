@@ -174,6 +174,7 @@ func (r *router) AddRouteFiltering(
 		r.removeRouteRules(string(ruleKey))
 
 		if retryErr := r.installRouteRules(string(ruleKey), params, sources, false); retryErr != nil {
+			r.removeRouteRules(string(ruleKey))
 			return nil, fmt.Errorf("add route rule (ipset: %w): %w", unusable.cause, retryErr)
 		}
 
@@ -182,6 +183,11 @@ func (r *router) AddRouteFiltering(
 	}
 
 	if err != nil {
+		// Leave nothing half-installed: a later call finding the rule key would
+		// report success while some sources were never installed, which for a
+		// drop rule would leave them unblocked.
+		r.removeRouteRules(string(ruleKey))
+
 		return nil, fmt.Errorf("add route rule: %w", err)
 	}
 
@@ -221,6 +227,20 @@ func (r *router) genRouteRuleSpecs(params routeFilteringRuleParams, sources []ne
 		return nil, fmt.Errorf("apply network -d: %w", err)
 	}
 
+	specs, err := r.genSourceRules(params, sources, useIPSet, destExp)
+	if err != nil {
+		// The destination match may have taken a set reference already.
+		if decErr := r.decrementSetCounter(destExp); decErr != nil {
+			log.Debugf("release destination set after failed rule generation: %v", decErr)
+		}
+
+		return nil, err
+	}
+
+	return specs, nil
+}
+
+func (r *router) genSourceRules(params routeFilteringRuleParams, sources []netip.Prefix, useIPSet bool, destExp []string) ([][]string, error) {
 	if useIPSet || len(sources) <= 1 {
 		sourceExp, err := r.applyNetwork("-s", sourceNetwork(sources), sources)
 		if err != nil {
