@@ -6,7 +6,7 @@ no external identity provider, no persistent volumes.
 | Workload | Source | Port |
 | --- | --- | --- |
 | `server` | this repo, `combined/Dockerfile.autonoma` | 8080 |
-| `dashboard` | `Autonoma-Labs/dashboard`, `docker/Dockerfile.autonoma` | 80 |
+| `dashboard` | `Autonoma-Labs/netbird-dashboard`, `docker/Dockerfile.autonoma` | 80 |
 | `db` | Postgres 16 | 5432 |
 
 `server` is the combined NetBird server: management, signal, relay and the
