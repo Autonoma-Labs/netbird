@@ -81,7 +81,8 @@ present in the database after a seed.
 - [x] Concurrent instances: `sdk up --repeat 3` brings three tenants up at once
       and tears all three down
 - [x] `golangci-lint` clean on every package this touches
-- [x] Branch pushed and pull request opened
+- [x] Branch pushed and pull request opened:
+      <https://github.com/Autonoma-Labs/netbird/pull/1>
 
 ### Fields the application compares against the current time
 
