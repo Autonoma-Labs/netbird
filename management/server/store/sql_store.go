@@ -171,6 +171,20 @@ func (s *SqlStore) CreatePeerJob(ctx context.Context, job *types.Job) error {
 	return nil
 }
 
+// DeletePeerJob removes a job row scoped to its account. Jobs carry no foreign
+// key back to peers or accounts, so nothing else reclaims them.
+func (s *SqlStore) DeletePeerJob(ctx context.Context, accountID, jobID string) error {
+	result := s.db.
+		Where(accountAndIDQueryCondition, accountID, jobID).
+		Delete(&types.Job{})
+
+	if result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to delete job from store: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to delete job from store")
+	}
+	return nil
+}
+
 func (s *SqlStore) CompletePeerJob(ctx context.Context, job *types.Job) error {
 	result := s.db.
 		Model(&types.Job{}).
@@ -6676,4 +6690,80 @@ func (s *SqlStore) GetRoutingPeerNetworks(_ context.Context, accountID, peerID s
 	}
 
 	return names, nil
+}
+
+// The deletes below reclaim rows that hang off an account but carry neither a
+// foreign key nor a GORM association back to it, so DeleteAccount leaves them
+// behind. Nothing in the application removes them individually — retention
+// sweeps age them out instead — so they exist for callers that have to unwind an
+// exact set of rows, such as the Autonoma environment factory's teardown. Each
+// is scoped by account so it can never reach another tenant's data.
+
+// DeleteAccessLogEntry removes a single reverse-proxy access-log row.
+func (s *SqlStore) DeleteAccessLogEntry(ctx context.Context, accountID, entryID string) error {
+	result := s.db.
+		Where(accountAndIDQueryCondition, accountID, entryID).
+		Delete(&accesslogs.AccessLogEntry{})
+
+	if result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to delete access log entry: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to delete access log entry")
+	}
+	return nil
+}
+
+// DeleteAgentNetworkAccessLog removes an agent-network access-log row together
+// with the authorising-group, usage and usage-group children derived from it.
+func (s *SqlStore) DeleteAgentNetworkAccessLog(ctx context.Context, accountID, logID string) error {
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("account_id = ? AND usage_id = ?", accountID, logID).
+			Delete(&agentNetworkTypes.AgentNetworkUsageGroup{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where(accountAndIDQueryCondition, accountID, logID).
+			Delete(&agentNetworkTypes.AgentNetworkUsage{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("account_id = ? AND log_id = ?", accountID, logID).
+			Delete(&agentNetworkTypes.AgentNetworkAccessLogGroup{}).Error; err != nil {
+			return err
+		}
+		return tx.Where(accountAndIDQueryCondition, accountID, logID).
+			Delete(&agentNetworkTypes.AgentNetworkAccessLog{}).Error
+	})
+	if err != nil {
+		log.WithContext(ctx).Errorf("failed to delete agent-network access log %s: %v", logID, err)
+		return status.Errorf(status.Internal, "failed to delete agent-network access log")
+	}
+	return nil
+}
+
+// DeleteAgentNetworkConsumptionForAccount removes every consumption counter of
+// an account. Counters have no surrogate key — they are identified by the
+// (account, dimension, window) tuple they aggregate — so they are reclaimed for
+// the whole account rather than one at a time.
+func (s *SqlStore) DeleteAgentNetworkConsumptionForAccount(ctx context.Context, accountID string) error {
+	result := s.db.
+		Where(accountIDCondition, accountID).
+		Delete(&agentNetworkTypes.Consumption{})
+
+	if result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to delete agent-network consumption: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to delete agent-network consumption")
+	}
+	return nil
+}
+
+// DeleteProxyAccessToken removes an account-scoped proxy access token. The API
+// only revokes tokens, which keeps the row for the audit trail.
+func (s *SqlStore) DeleteProxyAccessToken(ctx context.Context, accountID, tokenID string) error {
+	result := s.db.
+		Where("account_id = ? AND id = ?", accountID, tokenID).
+		Delete(&types.ProxyAccessToken{})
+
+	if result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to delete proxy access token: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to delete proxy access token")
+	}
+	return nil
 }

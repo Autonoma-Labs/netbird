@@ -25,6 +25,7 @@ import (
 	"github.com/netbirdio/netbird/encryption"
 	"github.com/netbirdio/netbird/formatter/hook"
 	"github.com/netbirdio/netbird/management/internals/modules/agentnetwork"
+	"github.com/netbirdio/netbird/management/internals/modules/autonoma"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs"
 	accesslogsmanager "github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs/manager"
 	proxyactivity "github.com/netbirdio/netbird/management/internals/modules/reverseproxy/activity"
@@ -128,6 +129,26 @@ func (s *BaseServer) APIHandler() http.Handler {
 		if err != nil {
 			log.Fatalf("failed to create API handler: %v", err)
 		}
+
+		// Registered on the same subrouter, after the REST endpoints, because it
+		// needs managers NewAPIHandler is not given. It is a no-op unless
+		// AUTONOMA_SHARED_SECRET is set.
+		autonoma.RegisterEndpoints(s.Router(), autonoma.Deps{
+			Store:             s.Store(),
+			AccountManager:    s.AccountManager(),
+			IdpManager:        s.IdpManager(),
+			NetworksManager:   s.NetworksManager(),
+			RoutersManager:    s.RoutesManager(),
+			ResourcesManager:  s.ResourcesManager(),
+			ZonesManager:      s.ZonesManager(),
+			RecordsManager:    s.RecordsManager(),
+			ServiceManager:    s.ServiceManager(),
+			DomainManager:     s.ReverseProxyDomainManager(),
+			AccessLogsManager: s.AccessLogsManager(),
+			ProxyManager:      s.ProxyManager(),
+			AgentNetwork:      s.AgentNetworkManager(),
+		})
+
 		return httpAPIHandler
 	})
 }

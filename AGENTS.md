@@ -29,6 +29,7 @@ in this file, not duplicated there.
 - [Pitfalls](#pitfalls)
 - [Commits, PRs, releases](#commits-prs-releases)
 - [After you push: CI and review bots](#after-you-push-ci-and-review-bots)
+- [Autonoma test data](#autonoma-test-data)
 - [Discussion and support](#discussion-and-support)
 
 ## STOP and ask the user before
@@ -773,6 +774,24 @@ repository, so their detail lives on the PR check, not in the Actions logs.
 - **Do not paper over flakes with blind re-runs.** Identify the failure first. If
   it is a known flake, name it; if you cannot tell, report it as unresolved
   rather than re-running until it goes green.
+
+## Autonoma test data
+
+Autonoma runs end-to-end suites against a preview deployment of a pull request.
+Before each run it seeds a whole tenant — users, peers, groups, policies, routes,
+DNS, an exposed service, Agent Network governance — through the Environment
+Factory endpoint at `/api/autonoma`
+(`management/internals/modules/autonoma/`), and deletes it again afterwards. Each
+factory there creates through the same manager the REST API and gRPC server use,
+so seeded rows carry the real validation, hashing, activity events and
+network-map updates rather than a raw insert's approximation of them.
+
+**When you add or change a model, or the code that creates one, update the
+matching factory.** A model with no factory cannot appear in a scenario, and a
+factory still calling a creation path you have moved or renamed fails the whole
+seed — which surfaces as every test in the suite failing at setup. The endpoint
+only answers requests signed with `AUTONOMA_SHARED_SECRET`, and is not registered
+at all when that variable is unset.
 
 ## Discussion and support
 
