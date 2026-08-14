@@ -129,10 +129,9 @@ func (s *BaseServer) IdpManager() idp.Manager {
 				log.Fatalf("failed to create embedded IDP service: %v", err)
 			}
 
-			if val := isMFAEnabledForAccount(s.Store().GetAllAccounts(context.Background())); val {
-				if err := embeddedMgr.SetMFAEnabled(context.Background(), val); err != nil {
-					log.Errorf("failed to set MFA enabled on embedded IDP: %v", err)
-				}
+			mfaEnabled := isMFAEnabledForAccount(s.Store().GetAllAccounts(context.Background()))
+			if err := embeddedMgr.SetMFAEnabled(context.Background(), mfaEnabled); err != nil {
+				log.Errorf("failed to set MFA enabled on embedded IDP: %v", err)
 			}
 
 			return embeddedMgr
